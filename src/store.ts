@@ -478,10 +478,12 @@ export class ForgeStore {
       }
     }
     // Distance from any want commit (0-based). depth N keeps distance < N.
+    // Index-headed queue, not shift(): shift() is O(n) per pop.
     const dist = new Map<string, number>();
     const queue: Array<[string, number]> = commitRoots.map((oid) => [oid, 0] as [string, number]);
-    while (queue.length > 0) {
-      const [oid, d] = queue.shift()!;
+    let qHead = 0;
+    while (qHead < queue.length) {
+      const [oid, d] = queue[qHead++]!;
       if (dist.has(oid)) continue;
       if (depth !== null && d >= depth) continue;
       dist.set(oid, d);

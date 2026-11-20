@@ -227,8 +227,9 @@ export function mergeBase(a: string, b: string, lookup: Lookup): string | null {
   if (a === b) return a;
   const distA = new Map<string, number>();
   const queueA: Array<[string, number]> = [[a, 0]];
-  while (queueA.length > 0) {
-    const [oid, d] = queueA.shift()!;
+  let headA = 0;
+  while (headA < queueA.length) {
+    const [oid, d] = queueA[headA++]!;
     if (distA.has(oid)) continue;
     distA.set(oid, d);
     const obj = lookup(oid);
@@ -240,8 +241,9 @@ export function mergeBase(a: string, b: string, lookup: Lookup): string | null {
   const seenB = new Set<string>();
   let best: string | null = null;
   let bestScore = Infinity;
-  while (queueB.length > 0) {
-    const [oid, d] = queueB.shift()!;
+  let headB = 0;
+  while (headB < queueB.length) {
+    const [oid, d] = queueB[headB++]!;
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     const da = distA.get(oid);

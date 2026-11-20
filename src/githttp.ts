@@ -375,14 +375,10 @@ export async function handleReceivePack(
       reportLines.push(`ng ${command.ref} unpack failed`);
     }
   }
-  const reportText = [`unpack ${unpackOk ? 'ok' : unpackDetail}`, ...reportLines]
-    .map((line) => `${line}\n`)
-    .join('');
+  // One pkt-line per report line, built directly (the old join-then-split
+  // round-tripped the same bytes through two throwaway strings).
   const inner = Buffer.concat(
-    reportText
-      .split('\n')
-      .filter((s) => s !== '')
-      .map((line) => pktLine(`${line}\n`)),
+    [`unpack ${unpackOk ? 'ok' : unpackDetail}`, ...reportLines].map((line) => pktLine(`${line}\n`)),
   );
   const useSideband = clientCaps.includes('side-band-64k');
   const out: Buffer[] = [];

@@ -13,9 +13,15 @@ export function nextRequestId(): string {
   return `forge-b-${requestCounter.toString(16).padStart(8, '0')}`;
 }
 
+/**
+ * The bearer token the entry was given, read once at module load:
+ * process.env access is slow, and this is called on every authenticated
+ * request. The token never changes during a process's life.
+ */
+const CACHED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 /** The bearer token the entry was given, or '' when the trial did not set one. */
 export function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return CACHED_TOKEN;
 }
 
 /** True when the request carries the trial token (or any Bearer when none is configured). */
@@ -90,7 +96,10 @@ export function readBody(req: IncomingMessage, limit = 32 * 1024 * 1024): Promis
       chunks.push(chunk);
     });
     req.on('end', () => {
-      if (!failed) resolve(Buffer.concat(chunks, total));
+      if (failed) return;
+      // Single-chunk bodies (the common case for small requests) skip the copy.
+      if (chunks.length === 1 && Buffer.isBuffer(chunks[0])) resolve(chunks[0]!);
+      else resolve(Buffer.concat(chunks, total));
     });
     req.on('error', (err) => {
       if (!failed) {
@@ -130,11 +139,14 @@ export function pathSegments(pathname: string): string[] {
   return out;
 }
 
+/** Shared empty query map: callers only read it (`.get`), never mutate it. */
+const EMPTY_QUERY: ReadonlyMap<string, string> = new Map<string, string>();
+
 /** Parse a query string into a map (first value wins). */
 export function queryOf(url: string): Map<string, string> {
-  const out = new Map<string, string>();
   const at = url.indexOf('?');
-  if (at < 0) return out;
+  if (at < 0) return EMPTY_QUERY as Map<string, string>;
+  const out = new Map<string, string>();
   for (const pair of url.slice(at + 1).split('&')) {
     if (pair === '') continue;
     const eq = pair.indexOf('=');

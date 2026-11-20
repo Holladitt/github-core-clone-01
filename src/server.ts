@@ -47,9 +47,21 @@ export function createForgeServer(store: ForgeStore = new ForgeStore()): Server 
           return;
         }
 
-        if (await handleGraphql(store, req, res)) return;
-        if (await handleMcp(store, req, res)) return;
-        if (await handleRest(store, req, res)) return;
+        // Fast-path dispatch by path prefix: the four surfaces live on
+        // disjoint paths, so each request reaches exactly one handler
+        // (each handler still returns false for a path it does not own,
+        // so this is identical to trying them in order — without paying
+        // for two extra URL parses and handler entries per request).
+        if (path === '/mcp') {
+          if (await handleMcp(store, req, res)) return;
+        } else if (path === '/api/graphql') {
+          if (await handleGraphql(store, req, res)) return;
+        } else if (path.startsWith('/api/v3')) {
+          // handleRest owns every /api/v3 path (it returns false only
+          // for a path that does not start with /api/v3).
+          await handleRest(store, req, res);
+          return;
+        }
 
         sendJson(res, 404, { message: 'Not Found' });
       } catch (err) {
