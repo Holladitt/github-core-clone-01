@@ -10,7 +10,7 @@ import { handleMcp } from './mcp.ts';
 import { pathSegments, pathnameOf, queryOf, sendJson } from './util.ts';
 
 export function createForgeServer(store: ForgeStore = new ForgeStore()): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const path = pathnameOf(req);
@@ -74,4 +74,10 @@ export function createForgeServer(store: ForgeStore = new ForgeStore()): Server 
       }
     })();
   });
+  // Latency hygiene (round 4): small request/response pairs over a
+  // virtualized network stack must not wait on Nagle/delayed-ACK batching.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }

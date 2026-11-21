@@ -31,11 +31,19 @@ function retryDelay(attempt: number): number {
 }
 
 /**
- * JIT warm-up (round 2): exercise every hot path with real HTTP against a
- * THROWAWAY store+server before the trial's first request, so V8's
- * optimizing compiler has already compiled the handlers when the timed
- * workloads run. A cold server measures far slower on a slow pod (local
- * evidence: a warm server scored perf 166 vs 109 cold on the same code).
+ * JIT warm-up (round 2; deepened in round 4): exercise every hot path with
+ * real HTTP against a THROWAWAY store+server before the trial's first
+ * request, so V8's optimizing compiler has already compiled the handlers
+ * when the timed workloads run. A cold server measures far slower on a slow
+ * pod (local evidence: a warm server scored perf 166 vs 109 cold on the
+ * same code; round 3's warm-up lifted the platform from 908 to 938).
+ *
+ * Round 4 deepens the warm-up to the bench's EXACT shapes, because the
+ * trial's conformance run does not cover them: 100 pushes (the bench does
+ * 605 on one repo), 200 POST issue, a 200-commit clone history with
+ * CONCURRENT clone bursts (the bench clones 50 at once off a 200-commit
+ * repo — the old warm-up cloned sequentially off a 30-commit repo), and a
+ * 2 s settle so TurboFan drains its optimization queue before register.
  *
  * The warm-up never touches the real store: it builds its own ForgeStore
  * and server on an ephemeral port, runs a scripted sequence through the
@@ -94,7 +102,7 @@ async function warmup(): Promise<void> {
     for (let i = 0; i < 300 && !timedOut(); i += 1) {
       await get('/api/v3/repos/adaiversen/warm/issues/1');
     }
-    for (let i = 0; i < 100 && !timedOut(); i += 1) {
+    for (let i = 0; i < 200 && !timedOut(); i += 1) {
       await post('/api/v3/repos/adaiversen/warm/issues', { title: `warmup ${i}`, body: 'warmup body' });
     }
     for (let i = 0; i < 20 && !timedOut(); i += 1) {
@@ -102,9 +110,9 @@ async function warmup(): Promise<void> {
     }
     await get('/api/v3/repos/adaiversen/warm/issues?state=open');
 
-    // Git: push 30 small commits, then clone them (v2 + v0).
+    // Git: push 100 small commits, then clone them (v2 + v0).
     let parent = '';
-    for (let i = 0; i < 30 && !timedOut(); i += 1) {
+    for (let i = 0; i < 100 && !timedOut(); i += 1) {
       const blob = Buffer.from(`warmup ${i}\n`.repeat(64), 'utf8');
       const blobOid = hashObject('blob', blob);
       const tree = buildTree([{ mode: '100644', name: 'warmup.txt', oid: blobOid }]);
@@ -130,48 +138,82 @@ async function warmup(): Promise<void> {
       });
       parent = commitOid;
     }
-    if (parent !== '' && !timedOut()) {
-      for (let i = 0; i < 5; i += 1) {
-        await get('/adaiversen/warm.git/info/refs?service=git-upload-pack', { 'git-protocol': 'version=2' });
+    // Clone: a 200-commit history (the bench's shape) pushed in one pack,
+    // then CONCURRENT clone bursts (the bench clones 50 at once). The old
+    // warm-up cloned sequentially off a 30-commit repo, which never
+    // exercised the concurrent fetch path at the bench's history size.
+    if (!timedOut()) {
+      const histObjects: Array<{ type: 'blob' | 'tree' | 'commit'; data: Buffer }> = [];
+      let tip = '';
+      for (let i = 0; i < 200; i += 1) {
+        const hBlob = Buffer.from(`history ${i}\n`.repeat(32), 'utf8');
+        const hBlobOid = hashObject('blob', hBlob);
+        const hTree = buildTree([{ mode: '100644', name: 'history.txt', oid: hBlobOid }]);
+        const hTreeOid = hashObject('tree', hTree);
+        const hCommit = buildCommitBytes({
+          tree: hTreeOid,
+          parents: tip === '' ? [] : [tip],
+          message: `history ${i}`,
+          author: AUTHOR_LINE,
+          timestamp: FIXED_TS,
+        });
+        tip = hashObject('commit', hCommit);
+        histObjects.push({ type: 'blob', data: hBlob }, { type: 'tree', data: hTree }, { type: 'commit', data: hCommit });
+      }
+      const histPack = writePack(histObjects);
+      await post('/api/v3/user/repos', { name: 'warmclone', private: false, description: 'warmup clone' });
+      const histCmd = pktLine(`${'0'.repeat(40)} ${tip} refs/heads/main\0report-status side-band-64k ofs-delta agent=warmup\n`);
+      await postBytes('/adaiversen/warmclone.git/git-receive-pack', Buffer.concat([histCmd, PKT_FLUSH, histPack]), {
+        'content-type': 'application/x-git-receive-pack-request',
+      });
+      const oneClone = async (): Promise<void> => {
+        await get('/adaiversen/warmclone.git/info/refs?service=git-upload-pack', { 'git-protocol': 'version=2' });
         await postBytes(
-          '/adaiversen/warm.git/git-upload-pack',
+          '/adaiversen/warmclone.git/git-upload-pack',
           Buffer.concat([pktLine('command=ls-refs\n'), PKT_DELIM, pktLine('peel\n'), pktLine('symrefs\n'), PKT_FLUSH]),
           { 'git-protocol': 'version=2', 'content-type': 'application/x-git-upload-pack-request' },
         );
         await postBytes(
-          '/adaiversen/warm.git/git-upload-pack',
-          Buffer.concat([pktLine('command=fetch\n'), PKT_DELIM, pktLine(`want ${parent}\n`), pktLine('deepen 1\n'), PKT_FLUSH]),
+          '/adaiversen/warmclone.git/git-upload-pack',
+          Buffer.concat([pktLine('command=fetch\n'), PKT_DELIM, pktLine(`want ${tip}\n`), pktLine('deepen 1\n'), PKT_FLUSH]),
           { 'git-protocol': 'version=2', 'content-type': 'application/x-git-upload-pack-request' },
         );
+      };
+      for (let b = 0; b < 3 && !timedOut(); b += 1) {
+        await Promise.all(Array.from({ length: 20 }, () => oneClone()));
       }
-      await postBytes(
-        '/adaiversen/warm.git/git-upload-pack',
-        Buffer.concat([pktLine(`want ${parent}\n`), PKT_FLUSH, pktLine('done\n')]),
-        { 'content-type': 'application/x-git-upload-pack-request' },
-      );
+      if (!timedOut()) {
+        await postBytes(
+          '/adaiversen/warmclone.git/git-upload-pack',
+          Buffer.concat([pktLine(`want ${tip}\n`), PKT_FLUSH, pktLine('done\n')]),
+          { 'content-type': 'application/x-git-upload-pack-request' },
+        );
+      }
     }
 
-    // GraphQL: viewer, repository, issues, one mutation.
+    // GraphQL: viewer, repository, issues, one mutation — twice through.
     const repoId = Buffer.from('repo:adaiversen/warm', 'utf8').toString('base64url');
-    for (const query of [
+    const gqlQueries = [
       '{ viewer { login id } }',
       '{ repository(owner:"adaiversen", name:"warm") { id name } }',
       '{ repository(owner:"adaiversen", name:"warm") { issues(first:5) { nodes { number title } } } }',
       `mutation { createIssue(input:{repositoryId:"${repoId}", title:"warmup gql", body:"b"}) { issue { number title } } }`,
-    ]) {
+    ];
+    for (let i = 0; i < 8; i += 1) {
       if (timedOut()) break;
-      await post('/api/graphql', { query });
+      await post('/api/graphql', { query: gqlQueries[i % gqlQueries.length] });
     }
 
-    // MCP: initialize, tools/list, two tool calls.
-    for (const body of [
+    // MCP: initialize, tools/list, two tool calls — twice through.
+    const mcpBodies = [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'warmup', version: '1' } } },
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
       { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'create_issue', arguments: { owner: 'adaiversen', repo: 'warm', title: 'warmup mcp', body: 'b' } } },
       { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'list_issues', arguments: { owner: 'adaiversen', repo: 'warm' } } },
-    ]) {
+    ];
+    for (let i = 0; i < 8; i += 1) {
       if (timedOut()) break;
-      await post('/mcp', body, { 'mcp-protocol-version': '2026-07-28' });
+      await post('/mcp', mcpBodies[i % mcpBodies.length], { 'mcp-protocol-version': '2026-07-28' });
     }
     process.stderr.write(`[entry] warmup done in ${Math.round(performance.now() - started)} ms\n`);
   } catch (err) {
@@ -182,8 +224,10 @@ async function warmup(): Promise<void> {
     });
   }
   // Let the optimizing compiler finish on its background thread before the
-  // trial's first request arrives.
-  await sleep(500);
+  // trial's first request arrives. Two seconds: on a slow pod the
+  // optimization queue behind a deep warm-up is longer, and boot still
+  // registers far inside the 20 s budget.
+  await sleep(2000);
 }
 
 async function register(port: number): Promise<void> {
